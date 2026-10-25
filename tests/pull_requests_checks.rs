@@ -36,6 +36,69 @@ pub fn waits(t: &Obj, says: &str, names: &str) {
 }
 
 #[test]
+fn latest_named_success_replaces_earlier_failure_on_same_head() {
+    let list = vec![json!({"name":"Build","conclusion":"FAILURE","startedAt":"2026-10-25T01:00:00Z","databaseId":1}), json!({"name":"build","conclusion":"SUCCESS","startedAt":"2026-10-25T02:00:00Z","databaseId":2})];
+    assert!(matches!(sw::land::checks::sort(&list), sw::land::checks::Look::Passed));
+}
+
+#[test]
+fn latest_named_failure_blocks_earlier_success_even_when_listed_first() {
+    let list = vec![json!({"name":"build","conclusion":"FAILURE","startedAt":"2026-10-25T02:00:00Z"}), json!({"name":"build","conclusion":"SUCCESS","startedAt":"2026-10-25T01:00:00Z"})];
+    assert!(matches!(sw::land::checks::sort(&list), sw::land::checks::Look::Failed(_)));
+}
+
+#[test]
+fn newest_pending_and_missing_required_check_never_look_passed() {
+    let list = vec![json!({"name":"build","conclusion":"SUCCESS","startedAt":"2026-10-25T01:00:00Z"}), json!({"name":"build","status":"IN_PROGRESS","conclusion":"","startedAt":"2026-10-25T02:00:00Z"})];
+    assert!(matches!(sw::land::checks::sort(&list), sw::land::checks::Look::Running(_)));
+    let tracked = json!({"checksWait":{"head":"same","via":"checks","names":["required"]}});
+    assert_eq!(sw::land::checks::missing(tracked.as_object().unwrap(), "same", "checks", &list), vec!["required"]);
+}
+
+#[test]
+fn numeric_ids_break_ties_and_missing_timestamps_remain_conservative() {
+    let ids = vec![json!({"name":"ci","conclusion":"FAILURE","id":42}), json!({"name":"ci","conclusion":"SUCCESS","id":43})];
+    assert!(matches!(sw::land::checks::sort(&ids), sw::land::checks::Look::Passed));
+    let unknown = vec![json!({"name":"ci","conclusion":"SUCCESS"}), json!({"name":"ci","conclusion":"FAILURE"})];
+    assert!(matches!(sw::land::checks::sort(&unknown), sw::land::checks::Look::Failed(_)));
+}
+
+#[test]
+fn pr_housekeeping_uses_latest_run_instead_of_retriggering_an_old_failure() {
+    let w = pr_world(json!({"review.rounds": 0}));
+    let id = to_approval(&w, "Housekeeping stale failure");
+    let head = task(&id).t("prHead");
+    let mut view = none(&head);
+    view["statusCheckRollup"] = json!([
+        {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-24T01:00:00Z"},
+        {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-24T02:00:00Z"}
+    ]);
+    w.gh_says(json!({"view":view}));
+    poll_prs();
+    let t = task(&id);
+    assert_eq!(t.s("prState"), "passing");
+    assert!(!t.b("prFailure"), "old failure was superseded: {}", t.at("prFailure"));
+    finish_line::approve(&id, None, false).unwrap();
+    assert_eq!(settle(&id).s("stage"), "done");
+    assert!(merged(&w));
+    drop(w);
+    let w = pr_world(json!({"review.rounds": 0}));
+    let id = to_approval(&w, "Housekeeping latest failed");
+    let head = task(&id).t("prHead");
+    let mut view = none(&head);
+    view["statusCheckRollup"] = json!([
+        {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-24T02:00:00Z"},
+        {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-24T01:00:00Z"}
+    ]);
+    w.gh_says(json!({"view":view}));
+    poll_prs();
+    let t = task(&id);
+    assert_eq!(t.s("prState"), "failing");
+    assert_eq!(strings(t.at("prFailure").at("checks")), vec!["build"]);
+    assert!(!merged(&w));
+}
+
+#[test]
 fn checks_still_running_the_merge_waits_and_says_so_then_merges_once_they_pass() {
     let w = pr_world(json!({}));
     let id = to_approval(&w, "Waits for CI");
