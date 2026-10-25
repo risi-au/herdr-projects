@@ -6,7 +6,6 @@ mod far;
 mod move_home;
 mod review_kit;
 mod takeover_kit;
-
 mod after;
 mod after_far;
 mod after_more;
@@ -118,6 +117,7 @@ mod check_again;
 mod check_progress;
 mod check_progress_rest;
 mod check_progress_run;
+mod stage_notice;
 mod check_script;
 mod check_script_since;
 mod cleanup_in_use;

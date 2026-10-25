@@ -29,6 +29,7 @@ pub fn run_job(job: &str, id: &str, extra: &[String]) -> i32 {
         "sweep" => { crate::leftovers::sweep::sweep(); }
         // What the tasks waited for on other machines are now (after/far_ask.rs).
         "afterfar" => crate::after::far_ask::far_pass(),
+        "stage-notice" => { crate::stage_notice::run(&id, extra.first().and_then(|n| n.parse().ok()).unwrap_or(0)); return 0; }
         // Its id is a herdr session, not a task.
         "coordinator" => { crate::coordinator::pump::pump(&if id.is_empty() || id == "-" { current_socket() } else { id.clone() }); id = "-".into(); }
         _ => { eprintln!("Unknown job {job}"); return 1; }

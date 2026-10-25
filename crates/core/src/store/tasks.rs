@@ -89,9 +89,11 @@ pub enum Change { Write, Keep }
 /// The one way a task changes: a short read-modify-write under its lock. Never held across a check, a review or a
 /// herdr call. `f` changes the task in place; returning `Change::Keep` writes nothing.
 pub fn update_wait(id: &str, wait_ms: i64, f: impl FnOnce(&mut Task) -> Res<Change>) -> Res<Task> {
-    with_task_lock(id, wait_ms, || {
+    let mut entry = false;
+    let t = with_task_lock(id, wait_ms, || {
         let mut t = get(id).ok_or_else(|| Error::new(format!("No task {id}")))?;
         let before = t.s("stage").to_string();
+        let was_waiting = super::stage_notice::entry_stage(&t).map(String::from);
         // The Watcher's sentence about the agent's work outlives the guess it came with: whatever this change does to
         // `watch` (every new run drops it), the sentence is kept with its time (status_kept.rs).
         if t.at("watch").s("role") == "agent" && !t.at("watch").s("msg").is_empty() {
@@ -103,9 +105,20 @@ pub fn update_wait(id: &str, wait_ms: i64, f: impl FnOnce(&mut Task) -> Res<Chan
             t.put("at", now());
             if !STAGES.contains(&t.s("stage")) { crate::fail!("Unknown stage {}", t.s("stage")); }
         }
+        // A monotonically increasing entry survives leave/re-enter even when the clock has not moved.
+        // A blocked flag changing without a stage change is an entry too (e.g. failed/auth).
+        if let Some(stage) = super::stage_notice::entry_stage(&t).map(String::from)
+            && was_waiting.as_deref() != Some(stage.as_str()) {
+            let serial = t.at("stageNotice").i("serial") + 1;
+            t.put("stageNotice", json!({ "serial": serial, "stage": stage, "entered": now() }));
+            entry = true;
+        }
         write_json(&task_file(id), &Value::Object(t.clone()))?;
         Ok(t)
-    })
+    })?;
+    // After the task lock is released. Same-stage writes never launch another job.
+    if entry { super::stage_notice::dispatch_once(&t); }
+    Ok(t)
 }
 pub fn update(id: &str, f: impl FnOnce(&mut Task) -> Res<Change>) -> Res<Task> { update_wait(id, 2000, f) }
 /// A change that always writes.
