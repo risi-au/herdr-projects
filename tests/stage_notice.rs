@@ -18,15 +18,56 @@ fn fixture() -> (common::World, String, std::path::PathBuf) {
         t.put("prHead", "0123456789abcdef0123456789abcdef01234567");
     }).unwrap();
     let out = w.base.join("relay-lines");
+    let route = w.base.join("route-mock");
+    std::fs::write(&route, "#!/bin/sh\necho 'to=fake-owner why=test'\n").unwrap();
+    std::fs::set_permissions(&route, std::fs::Permissions::from_mode(0o700)).unwrap();
     let relay = w.base.join("relay-mock");
     std::fs::write(&relay, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", out.display())).unwrap();
     std::fs::set_permissions(&relay, std::fs::Permissions::from_mode(0o700)).unwrap();
-    unsafe { std::env::set_var("HERDR_PROJECTS_WAKE_BIN", relay); }
+    unsafe { std::env::set_var("HERDR_PROJECTS_ALERT_BIN", relay); }
+    unsafe { std::env::set_var("HERDR_PROJECTS_ALERT_ROUTE_BIN", route); }
     (w, id, out)
 }
 
 fn enter(id: &str, stage: &str) -> i64 {
     patch(id, |t| { t.put("stage", stage); }).unwrap().at("stageNotice").i("serial")
+}
+
+#[test]
+fn blocked_flags_clear_without_stage_change_and_reenter_with_new_serial() {
+    for (stage, field, blocked) in [
+        ("after", "afterBlocked", json!("dependency failed")),
+        ("failed", "failure", json!({"auth":true})),
+        ("stopped", "limitStop", json!(true)),
+    ] {
+        let (_w, id, out) = fixture();
+        sw::clock::set(Some(1_000_000_000_000));
+        patch(&id, |t| { t.put("stage", stage); t.put(field, blocked.clone()); }).unwrap();
+        let serial = task(&id).at("stageNotice").i("serial");
+        assert!(task(&id).at("stageNotice").b("active"));
+        patch(&id, |t| t.put(field, Value::Null)).unwrap();
+        assert_eq!(task(&id).s("stage"), stage);
+        assert!(!task(&id).at("stageNotice").b("active"));
+        sw::stage_notice::run(&id, serial);
+        assert!(!out.exists(), "cleared {stage} sent stale callback");
+        patch(&id, |t| t.put(field, blocked.clone())).unwrap();
+        assert_eq!(task(&id).at("stageNotice").i("serial"), serial + 1);
+        sw::stage_notice::run(&id, serial);
+        assert!(!out.exists());
+        sw::stage_notice::run(&id, serial + 1);
+        assert_eq!(std::fs::read_to_string(out).unwrap().matches("fake-owner").count(), 1);
+    }
+}
+
+#[test]
+fn main_pinned_merge_by_you_is_not_called_rishi_approval() {
+    let (_w, id, _) = fixture();
+    let t = patch(&id, |t| { t.put("stage", "approval"); t.put("owner", "tester"); t.obj_mut("settings").put("merge.by", "you"); }).unwrap();
+    assert!(sw::stage_notice::approval_class(&t).starts_with("UNKNOWN"));
+    let explicit = patch(&id, |t| t.put("approvalAuthority", "Rishi")).unwrap();
+    assert!(sw::stage_notice::approval_class(&explicit).starts_with("RISHI"));
+    let unknown = patch(&id, |t| { t.put("approvalAuthority", Value::Null); t.put("requireApproval", true); }).unwrap();
+    assert!(sw::stage_notice::approval_class(&unknown).starts_with("UNKNOWN"));
 }
 
 #[test]
@@ -42,7 +83,7 @@ fn stage_commit_prompts_once_alerts_at_one_deferred_check_and_dedupes() {
     assert!(saved.at("stageNotice").b("pinged"));
     assert!(saved.at("stageNotice").b("alerted"));
     let text = std::fs::read_to_string(out).unwrap();
-    assert_eq!(text.matches("--event").count(), 1, "relay invoked twice: {text}");
+    assert_eq!(text.matches("fake-owner").count(), 1, "relay invoked twice: {text}");
     assert!(text.contains("stage=approval") && text.contains("age=30m") && text.contains(&id));
     assert!(text.contains("/pull/2") && text.contains("0123456789abcdef0123456789abcdef01234567"));
     assert_eq!(sw::coordinator::state::get(sw::coordinator::co::Co::top(&_w.socket)).unwrap().arr("queue").len(), 1);
@@ -77,7 +118,7 @@ fn leaving_and_reentering_produces_a_new_entry_and_only_the_new_one_alerts() {
     sw::stage_notice::run(&id, first);
     assert!(!out.exists());
     sw::stage_notice::run(&id, second);
-    assert_eq!(std::fs::read_to_string(out).unwrap().matches("--event").count(), 1);
+    assert_eq!(std::fs::read_to_string(out).unwrap().matches("fake-owner").count(), 1);
 }
 
 #[test]
@@ -92,7 +133,7 @@ fn failed_auth_becoming_blocked_is_a_real_entry_even_without_stage_change() {
     patch(&id, |t| { t.put("msg", "still blocked"); }).unwrap();
     assert_eq!(task(&id).at("stageNotice").i("serial"), entry);
     sw::stage_notice::run(&id, entry);
-    assert_eq!(std::fs::read_to_string(out).unwrap().matches("--event").count(), 1);
+    assert_eq!(std::fs::read_to_string(out).unwrap().matches("fake-owner").count(), 1);
 }
 
 #[test]
@@ -102,11 +143,20 @@ fn production_relay_process_posts_to_a_local_http_sink_once_under_concurrent_cal
     // No secret, customer data or real relay endpoint is used.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = format!("http://{}/", listener.local_addr().unwrap());
-    let relay = w.base.join("http-relay-mock");
-    let script = format!("#!/usr/bin/env python3\nimport json,sys,urllib.request\nurllib.request.urlopen({target:?}, data=json.dumps(sys.argv[1:]).encode(), timeout=3).read()\n");
-    std::fs::write(&relay, script).unwrap();
-    std::fs::set_permissions(&relay, std::fs::Permissions::from_mode(0o700)).unwrap();
-    unsafe { std::env::set_var("HERDR_PROJECTS_WAKE_BIN", relay); }
+    let installed = std::path::Path::new("/home/rishi/.local/bin/ask-grokbot");
+    if !installed.is_file() { return; } // Hosted CI has no Omarchy installation.
+    let endpoints = w.base.join("endpoints");
+    std::fs::create_dir_all(&endpoints).unwrap();
+    std::fs::write(endpoints.join("fake-owner.env"), format!("GROKBOT_WEBHOOK_URL={target}\nGROKBOT_WEBHOOK_KEY=synthetic-test-key\nOWNER_NAME=fake-owner\n")).unwrap();
+    let settings = w.base.join("grokbot-test-config.json");
+    std::fs::write(&settings, r#"{"ask_retry":true,"ask_fallback":true,"default_owner":"unregistered"}"#).unwrap();
+    unsafe {
+        std::env::set_var("HERDR_PROJECTS_ALERT_BIN", installed);
+        std::env::set_var("GROKBOT_ENDPOINTS_DIR", endpoints);
+        std::env::set_var("GROKBOT_CONFIG", settings);
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", w.base.join("private-test-state"));
+        std::env::set_var("HERDR_PANE_ID", "");
+    }
 
     let serial = enter(&id, "asks");
     let old = sw::clock::now() - sw::stage_notice::DELAY - 1000;
@@ -129,7 +179,7 @@ fn production_relay_process_posts_to_a_local_http_sink_once_under_concurrent_cal
             let headers = String::from_utf8_lossy(&request[..end]);
             let size = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|value| value.trim().parse::<usize>().ok())).unwrap();
             if request.len() < end + 4 + size { continue; }
-            let posted = serde_json::from_slice::<Vec<String>>(&request[end + 4..end + 4 + size]).unwrap();
+            let posted = serde_json::from_slice::<serde_json::Value>(&request[end + 4..end + 4 + size]).unwrap();
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").unwrap();
             return posted;
         }
@@ -139,8 +189,9 @@ fn production_relay_process_posts_to_a_local_http_sink_once_under_concurrent_cal
         for _ in 0..4 { scope.spawn(|| sw::stage_notice::run(&id, serial)); }
     });
     let sent = sink.join().unwrap();
-    assert_eq!(&sent[..4], &["post", id.as_str(), "--event", "update"]);
-    assert!(sent.join(" ").contains("stage=asks"));
+    assert_eq!(sent["type"], "message");
+    assert_eq!(sent["to_id"], "fake-owner");
+    assert!(sent["message"].as_str().unwrap_or("").contains("stage=asks"));
     assert!(task(&id).at("stageNotice").b("alerted"));
     // Another callback has neither a second coordinator prompt nor a second HTTP POST.
     sw::stage_notice::run(&id, serial);
@@ -157,7 +208,7 @@ fn the_real_task_commit_dispatches_the_production_cli_child_to_coordinator_and_h
     std::fs::write(&relay, script).unwrap();
     std::fs::set_permissions(&relay, std::fs::Permissions::from_mode(0o700)).unwrap();
     unsafe {
-        std::env::set_var("HERDR_PROJECTS_WAKE_BIN", relay);
+        std::env::set_var("HERDR_PROJECTS_ALERT_BIN", relay);
         std::env::set_var("HERDR_PROJECTS_STAGE_BIN", env!("CARGO_BIN_EXE_herdr-projects"));
         std::env::set_var("HERDR_PROJECTS_INLINE", "0");
     }

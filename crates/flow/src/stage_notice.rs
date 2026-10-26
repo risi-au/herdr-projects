@@ -13,7 +13,8 @@ fn claim(id: &str, serial: i64, column: &str, due: bool) -> Option<Obj> {
     let mut granted = false;
     let t = update(id, |t| {
         let entry = t.at("stageNotice");
-        if serial <= 0 || entry.i("serial") != serial || entry.s("stage") != t.s("stage")
+        if serial <= 0 || entry.i("serial") != serial || !entry.b("active")
+            || crate::store::stage_notice::entry_stage(t).is_none_or(|s| s != entry.s("stage"))
             || t.b("archivedAt") || t.s("stage") == "done" || entry.b(column)
             || (due && now().saturating_sub(entry.i("entered")) < DELAY) { return Ok(Change::Keep); }
         let mut e = entry.clone();
@@ -25,17 +26,23 @@ fn claim(id: &str, serial: i64, column: &str, due: bool) -> Option<Obj> {
     granted.then_some(t)
 }
 
+pub fn approval_class(t: &Obj) -> String {
+    if t.s("stage") != "approval" { return "UNKNOWN: blocked state requires coordinator investigation".into(); }
+    // Only explicit task evidence may name Rishi. A generic `you` merge setting applies to
+    // ordinary main-bound coordinator work as well and never identifies the actual approver.
+    if t.at("approval").s("authority") == "Rishi" || t.s("approvalAuthority") == "Rishi" {
+        return "RISHI: explicit approval authority recorded on this task".into();
+    }
+    if t.b("requireApproval") { return "UNKNOWN: required approval recorded without a named authority".into(); }
+    if crate::finish::auto_merge::by_itself(t) { return "NORMAL: merge.by=itself, coordinator verifies all merge gates".into(); }
+    "UNKNOWN: merge.by=you does not identify Rishi or authorize a coordinator merge".into()
+}
+
 fn metadata(t: &Obj) -> (String, String, String) {
     let pr = t.t("pr");
     let head = [t.s("prHead"), t.s("reviewedHead"), t.at("kept").s("head"), t.s("checkedHead")]
         .into_iter().find(|s| !s.is_empty()).unwrap_or("unknown").to_string();
-    let merge = if t.s("stage") != "approval" {
-        format!("blocked: coordinator to resolve according to the recorded kind ({})", if t.b("kind") { t.s("kind") } else { "unspecified" })
-    } else if t.b("requireApproval") || !crate::finish::auto_merge::by_itself(t) {
-        if t.s("owner") == crate::store::files::me() { "needs Rishi's own approval under the task's merge policy".into() }
-        else { "requires the assigned owner's approval under the task's merge policy".into() }
-    } else { "merge.by=itself: coordinator checks existing review and merge gates".into() };
-    (pr, head, merge)
+    (pr, head, approval_class(t))
 }
 
 fn owner(t: &Obj) -> Option<Co> {
@@ -48,23 +55,45 @@ fn owner(t: &Obj) -> Option<Co> {
 }
 
 fn prompt(t: &Obj) {
-    let Some(co) = owner(t) else { return; };
+    let Some(co) = owner(t) else { eprintln!("stage-notice: coordinator route unavailable"); return; };
     let (pr, head, merge) = metadata(t);
     let message = format!("Task {} entered {} (entry {}). PR: {}; head SHA: {}. {}. Inspect the task and coordinate the next action within existing approval rules.",
         t.s("id"), t.s("stage"), t.at("stageNotice").i("serial"), if pr.is_empty() { "unknown" } else { &pr }, head, merge);
-    let _ = requests::send(&folder_of(t.s("id")), &message, false, t.s("id"), co);
+    if requests::send(&folder_of(t.s("id")), &message, false, t.s("id"), co).is_err() {
+        eprintln!("stage-notice: coordinator message enqueue failed");
+    }
 }
 
 fn alert(t: &Obj) {
     let (pr, head, merge) = metadata(t);
     let entry = t.at("stageNotice");
     let age = now().saturating_sub(entry.i("entered")) / 60000;
-    let bin = std::env::var("HERDR_PROJECTS_WAKE_BIN").unwrap_or_else(|_| "/home/rishi/.local/bin/herdr-board-wake".into());
-    // This existing relay owns its HTTP endpoint/config. Arguments are never interpreted by a shell.
-    let detail = format!("task={} stage={} entry={} age={}m PR={} head={} {}", t.s("id"), t.s("stage"), entry.i("serial"), age,
+    let detail = format!("task={} stage={} entry={} age={}m PR={} head={} approval={} ", t.s("id"), t.s("stage"), entry.i("serial"), age,
         if pr.is_empty() { "unknown" } else { &pr }, head, merge);
-    let _ = Command::new(bin).args(["post", t.s("id"), "--event", "update", "--msg", &detail])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    // The installed board-wake `post` writes cos-status.json; it does NOT post to Omarchy.
+    // Resolve through the same owner-routing client as the board's existing blocked-task flow.
+    let route = std::env::var("HERDR_PROJECTS_ALERT_ROUTE_BIN")
+        .unwrap_or_else(|_| "/home/rishi/.local/bin/herdr-stuck-alert".into());
+    let resolved = Command::new(route).args(["--who", &format!("task:{}", t.s("id")), "--task", t.s("id")])
+        .stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let Some(to) = resolved.ok().filter(|o| o.status.success()).and_then(|o| {
+        let line = std::str::from_utf8(&o.stdout).ok()?.trim();
+        let who = line.strip_prefix("to=")?.split_once(" why=")?.0;
+        (!who.is_empty() && who.len() <= 120 && !who.starts_with('-')
+            && !who.chars().any(char::is_control)).then(|| who.to_string())
+    }) else { eprintln!("stage-notice: Omarchy owner route unavailable"); return; };
+    // ask-grokbot is the actual installed Omarchy HTTPS POST client. It owns endpoint/key
+    // loading and never places a key on argv. Disable its internal retries and fallback:
+    // the persisted task claim permits exactly one HTTP attempt for this entry.
+    let bin = std::env::var("HERDR_PROJECTS_ALERT_BIN")
+        .unwrap_or_else(|_| "/home/rishi/.local/bin/ask-grokbot".into());
+    match Command::new(bin).args([&to, &detail]).env("GROKBOT_NO_FALLBACK", "1")
+        .env("GROKBOT_RETRY_DELAYS", " ")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        Ok(status) if status.success() => {},
+        Ok(status) => eprintln!("stage-notice: Omarchy POST attempt failed (exit={})", status.code().unwrap_or(-1)),
+        Err(_) => eprintln!("stage-notice: Omarchy POST client unavailable"),
+    }
 }
 
 /// Runs in one detached child per stage entry. The child sleeps once and exits; no poll or timer service exists.

@@ -105,13 +105,19 @@ pub fn update_wait(id: &str, wait_ms: i64, f: impl FnOnce(&mut Task) -> Res<Chan
             t.put("at", now());
             if !STAGES.contains(&t.s("stage")) { crate::fail!("Unknown stage {}", t.s("stage")); }
         }
-        // A monotonically increasing entry survives leave/re-enter even when the clock has not moved.
-        // A blocked flag changing without a stage change is an entry too (e.g. failed/auth).
-        if let Some(stage) = super::stage_notice::entry_stage(&t).map(String::from)
-            && was_waiting.as_deref() != Some(stage.as_str()) {
-            let serial = t.at("stageNotice").i("serial") + 1;
-            t.put("stageNotice", json!({ "serial": serial, "stage": stage, "entered": now() }));
-            entry = true;
+        // Blocked flags can clear without the stage changing. The entry becomes inactive on
+        // that same committed write, so an old deferred callback cannot claim it afterward.
+        let waiting = super::stage_notice::entry_stage(&t).map(String::from);
+        if waiting != was_waiting {
+            if let Some(stage) = waiting {
+                let serial = t.at("stageNotice").i("serial") + 1;
+                t.put("stageNotice", json!({ "serial": serial, "stage": stage, "entered": now(), "active": true }));
+                entry = true;
+            } else if t.at("stageNotice").is_object() {
+                let mut notice = t.at("stageNotice").clone();
+                notice["active"] = json!(false);
+                t.put("stageNotice", notice);
+            }
         }
         write_json(&task_file(id), &Value::Object(t.clone()))?;
         Ok(t)
