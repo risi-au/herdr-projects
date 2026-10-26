@@ -28,14 +28,19 @@ fn claim(id: &str, serial: i64, column: &str, due: bool) -> Option<Obj> {
 
 pub fn approval_class(t: &Obj) -> String {
     if t.s("stage") != "approval" { return "UNKNOWN: blocked state requires coordinator investigation".into(); }
-    // Only explicit task evidence may name Rishi. A generic `you` merge setting applies to
-    // ordinary main-bound coordinator work as well and never identifies the actual approver.
-    if t.at("approval").s("authority") == "Rishi" || t.s("approvalAuthority") == "Rishi" {
-        return "RISHI: explicit approval authority recorded on this task".into();
+    // The stored task has no named human approver. `owner`, `merge.by=you`, and
+    // `requireApproval` refer to board workflow, not to Rishi's authority.
+    if t.b("requireApproval") { return "UNKNOWN: task requires a human decision; the approver is not recorded".into(); }
+    if t.b("syncBlocked") || t.b("mergeFailed") || t.b("failure") || t.b("prFailure") {
+        return "UNKNOWN: merge is blocked; coordinator must inspect the recorded failure".into();
     }
-    if t.b("requireApproval") { return "UNKNOWN: required approval recorded without a named authority".into(); }
-    if crate::finish::auto_merge::by_itself(t) { return "NORMAL: merge.by=itself, coordinator verifies all merge gates".into(); }
-    "UNKNOWN: merge.by=you does not identify Rishi or authorize a coordinator merge".into()
+    if !crate::finish::auto_merge::by_itself(t) {
+        return "UNKNOWN: merge.by=you or a held merge requires approval; no named Rishi authority is recorded".into();
+    }
+    if !crate::finish::auto_merge::green(t) {
+        return "UNKNOWN: automatic merge gates are not confirmed (review, head, checks, or task state)".into();
+    }
+    "NORMAL: existing automatic merge path is eligible; coordinator verifies current gates before merge".into()
 }
 
 fn metadata(t: &Obj) -> (String, String, String) {

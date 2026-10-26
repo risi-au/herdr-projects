@@ -64,10 +64,25 @@ fn main_pinned_merge_by_you_is_not_called_rishi_approval() {
     let (_w, id, _) = fixture();
     let t = patch(&id, |t| { t.put("stage", "approval"); t.put("owner", "tester"); t.obj_mut("settings").put("merge.by", "you"); }).unwrap();
     assert!(sw::stage_notice::approval_class(&t).starts_with("UNKNOWN"));
-    let explicit = patch(&id, |t| t.put("approvalAuthority", "Rishi")).unwrap();
-    assert!(sw::stage_notice::approval_class(&explicit).starts_with("RISHI"));
-    let unknown = patch(&id, |t| { t.put("approvalAuthority", Value::Null); t.put("requireApproval", true); }).unwrap();
-    assert!(sw::stage_notice::approval_class(&unknown).starts_with("UNKNOWN"));
+    let invented = patch(&id, |t| t.put("approvalAuthority", "Rishi")).unwrap();
+    assert!(sw::stage_notice::approval_class(&invented).starts_with("UNKNOWN"));
+    let held = patch(&id, |t| t.put("requireApproval", true)).unwrap();
+    assert!(sw::stage_notice::approval_class(&held).contains("approver is not recorded"));
+    assert!(sw::stage_notice::approval_class(&held).starts_with("UNKNOWN"));
+}
+
+#[test]
+fn automatic_merges_need_actual_gate_evidence_and_alert_explains_unknown() {
+    let (_w, id, out) = fixture();
+    sw::clock::set(Some(1_000_000_000_000));
+    let serial = enter(&id, "approval");
+    let t = patch(&id, |t| {
+        t.obj_mut("settings").put("merge.by", "itself");
+        t.put("requireApproval", false);
+    }).unwrap();
+    assert!(sw::stage_notice::approval_class(&t).contains("gates are not confirmed"));
+    sw::stage_notice::run(&id, serial);
+    assert!(std::fs::read_to_string(out).unwrap().contains("approval=UNKNOWN: automatic merge gates are not confirmed"));
 }
 
 #[test]
