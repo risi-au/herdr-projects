@@ -32,6 +32,7 @@ pub mod review_page;
 pub mod runner;
 pub mod shown;
 pub mod state;
+pub mod stage_notice;
 pub mod status_kept;
 pub mod submit;
 pub mod sync;

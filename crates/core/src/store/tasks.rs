@@ -89,9 +89,11 @@ pub enum Change { Write, Keep }
 /// The one way a task changes: a short read-modify-write under its lock. Never held across a check, a review or a
 /// herdr call. `f` changes the task in place; returning `Change::Keep` writes nothing.
 pub fn update_wait(id: &str, wait_ms: i64, f: impl FnOnce(&mut Task) -> Res<Change>) -> Res<Task> {
-    with_task_lock(id, wait_ms, || {
+    let mut entry = false;
+    let t = with_task_lock(id, wait_ms, || {
         let mut t = get(id).ok_or_else(|| Error::new(format!("No task {id}")))?;
         let before = t.s("stage").to_string();
+        let was_waiting = super::stage_notice::entry_stage(&t).map(String::from);
         // The Watcher's sentence about the agent's work outlives the guess it came with: whatever this change does to
         // `watch` (every new run drops it), the sentence is kept with its time (status_kept.rs).
         if t.at("watch").s("role") == "agent" && !t.at("watch").s("msg").is_empty() {
@@ -103,9 +105,26 @@ pub fn update_wait(id: &str, wait_ms: i64, f: impl FnOnce(&mut Task) -> Res<Chan
             t.put("at", now());
             if !STAGES.contains(&t.s("stage")) { crate::fail!("Unknown stage {}", t.s("stage")); }
         }
+        // Blocked flags can clear without the stage changing. The entry becomes inactive on
+        // that same committed write, so an old deferred callback cannot claim it afterward.
+        let waiting = super::stage_notice::entry_stage(&t).map(String::from);
+        if waiting != was_waiting {
+            if let Some(stage) = waiting {
+                let serial = t.at("stageNotice").i("serial") + 1;
+                t.put("stageNotice", json!({ "serial": serial, "stage": stage, "entered": now(), "active": true }));
+                entry = true;
+            } else if t.at("stageNotice").is_object() {
+                let mut notice = t.at("stageNotice").clone();
+                notice["active"] = json!(false);
+                t.put("stageNotice", notice);
+            }
+        }
         write_json(&task_file(id), &Value::Object(t.clone()))?;
         Ok(t)
-    })
+    })?;
+    // After the task lock is released. Same-stage writes never launch another job.
+    if entry { super::stage_notice::dispatch_once(&t); }
+    Ok(t)
 }
 pub fn update(id: &str, f: impl FnOnce(&mut Task) -> Res<Change>) -> Res<Task> { update_wait(id, 2000, f) }
 /// A change that always writes.
